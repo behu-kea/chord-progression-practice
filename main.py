@@ -2,6 +2,9 @@ import random
 import os
 import subprocess
 import tempfile
+import threading
+import tkinter as tk
+from tkinter import messagebox
 from mido import MidiFile, MidiTrack, Message, MetaMessage
 from pydub import AudioSegment
 
@@ -48,27 +51,24 @@ possible_roots = {
     "B": 71
 }
 
-
-def generate_progression():
-    """Generate a progression that always starts with I and adds 1–3 additional chords."""
-    prog_length = random.randint(2, 4)  # Total chords between 2 and 4.
+def generate_progression(prog_length=None):
+    """Generate a progression that always starts with I and adds (prog_length - 1) additional chords."""
+    if prog_length is None:
+        prog_length = random.randint(2, 4)
+    else:
+        prog_length = int(prog_length)
+    if prog_length < 1:
+        prog_length = 1
+    if prog_length == 1:
+        return ["I"]
     additional = random.sample(additional_chords, prog_length - 1)
     return ["I"] + additional
 
-
 def get_chord_notes(tonic, roman):
-    """Compute chord note MIDI numbers from the tonic and chord formula."""
     offsets = chord_formulas[roman]
     return [tonic + offset for offset in offsets]
 
-
 def apply_inversion(chord, inversion):
-    """
-    Apply the given inversion to the chord.
-    Inversion 0: no change.
-    Inversion 1: move the first note up one octave.
-    Inversion 2: move the first two notes up one octave.
-    """
     if inversion == 0:
         return chord
     elif inversion == 1:
@@ -76,13 +76,7 @@ def apply_inversion(chord, inversion):
     elif inversion == 2:
         return [chord[2], chord[0] + 12, chord[1] + 12]
 
-
 def choose_best_voicing(tonic, roman, target_avg):
-    """
-    For the given chord (other than I), try each inversion (0, 1, 2)
-    and also consider shifting the resulting voicing down an octave.
-    Return the candidate whose average pitch is closest to target_avg.
-    """
     base = get_chord_notes(tonic, roman)
     best_voicing = None
     best_diff = float('inf')
@@ -97,108 +91,119 @@ def choose_best_voicing(tonic, roman, target_avg):
                 best_voicing = candidate
     return best_voicing
 
-
 def create_midi_for_progression(progression, tonic, chord_duration_ticks=960, gap_ticks=240, rep_gap_ticks=960):
-    """
-    Create a MIDI file for the given progression (using ticks_per_beat=480).
-    Tempo is set to 60 BPM (1 beat = 1 second).
-    The progression is played twice.
-
-    For chords other than I, choose the voicing (from all inversions and a possible octave drop)
-    whose average pitch is closest to the I chord in root position.
-    """
     mid = MidiFile(ticks_per_beat=480)
     track = MidiTrack()
     mid.tracks.append(track)
-
-    # Set tempo: 60 BPM → 1,000,000 microseconds per beat.
     track.append(MetaMessage('set_tempo', tempo=1000000, time=0))
-
-    # Compute target average from I chord in root position.
     I_chord = get_chord_notes(tonic, "I")
     target_avg = sum(I_chord) / len(I_chord)
-
-    # Pre-calculate best voicings for each chord in the progression.
     voicings = []
     for roman in progression:
         if roman == "I":
-            voicing = I_chord  # Use root position for I
+            voicing = I_chord
         else:
             voicing = choose_best_voicing(tonic, roman, target_avg)
         voicings.append(voicing)
-
-    # Play the progression twice.
     for rep in range(2):
         for idx, roman in enumerate(progression):
             voicing = voicings[idx]
-            # Turn on all chord notes.
             for note in voicing:
                 track.append(Message('note_on', note=note, velocity=100, time=0))
-            # Hold chord for chord_duration_ticks.
             for i, note in enumerate(voicing):
                 track.append(Message('note_off', note=note, velocity=0, time=chord_duration_ticks if i == 0 else 0))
-            # Add gap only if this is not the last chord in the repetition.
             if idx < len(progression) - 1:
                 track.append(MetaMessage('marker', text='gap', time=gap_ticks))
-        # Add a longer gap between the two repetitions.
         if rep < 1:
             track.append(MetaMessage('marker', text='rep_gap', time=rep_gap_ticks))
     return mid
 
-
 def generate_tts(text, filename):
-    """Generate TTS audio using macOS’s 'say' command (output as AIFF)."""
     subprocess.run(["say", "-o", filename, text], check=True)
 
-
-def main():
+def generate_audio(prog_length, num_progressions, output_filename):
     final_audio = AudioSegment.empty()
-    num_progressions = 3  # Maximum three progressions.
     soundfont = "FluidR3_GM.sf2"  # Update path if necessary.
-
-    # Define pauses.
-    pause_between_prog_and_tts = AudioSegment.silent(duration=300)  # 300 ms before TTS
-    end_pause = AudioSegment.silent(duration=1000)  # 1-second pause at the end
-
-    # Use a temporary directory for all intermediate files.
+    pause_between_prog_and_tts = AudioSegment.silent(duration=300)
+    end_pause = AudioSegment.silent(duration=1000)
     with tempfile.TemporaryDirectory() as tmpdir:
         for i in range(num_progressions):
-            # Choose a random root key from all 12 keys.
             key_name, tonic = random.choice(list(possible_roots.items()))
-            progression = generate_progression()
+            progression = generate_progression(prog_length)
             tts_text = " to ".join(roman_to_number[ch] for ch in progression)
             print(f"Progression in key {key_name}: {tts_text}")
-
-            # Define file paths within the temporary directory.
             midi_filename = os.path.join(tmpdir, f"temp_{i}.mid")
             wav_filename = os.path.join(tmpdir, f"temp_{i}.wav")
             tts_filename = os.path.join(tmpdir, f"tts_{i}.aiff")
-
-            # Create and save MIDI file.
             midi = create_midi_for_progression(progression, tonic)
             midi.save(midi_filename)
-
-            # Render the MIDI file to WAV using FluidSynth.
-            subprocess.run(["fluidsynth", "-ni", soundfont, midi_filename, "-F", wav_filename, "-r", "44100"],
-                           check=True)
-
+            subprocess.run(["fluidsynth", "-ni", soundfont, midi_filename, "-F", wav_filename, "-r", "44100"], check=True)
             chord_audio = AudioSegment.from_file(wav_filename, format="wav")
-
-            # Generate TTS audio (only the numbers, no extra words).
             generate_tts(tts_text, tts_filename)
             tts_audio = AudioSegment.from_file(tts_filename, format="aiff")
-            # Lower the TTS volume by 6 dB.
             tts_audio = tts_audio.apply_gain(-6)
-
-            # Concatenate: chord progression, short pause, TTS announcement, then end pause.
             section = chord_audio + pause_between_prog_and_tts + tts_audio + end_pause
             final_audio += section
 
-        # Export the final audio file.
-        final_audio.export("chord_progressions.wav", format="wav")
-        print("Final audio saved as chord_progressions.wav")
-        # All intermediate files in tmpdir are automatically removed here.
+    base, ext = os.path.splitext(output_filename)
+    if ext.lower() == '.mp3':
+        final_audio.export(output_filename, format="mp3")
+        print(f"Final audio saved as {output_filename}")
+    else:
+        final_audio.export(output_filename, format="wav")
+        print(f"Final audio saved as {output_filename}")
+        # Also export to MP3
+        mp3_filename = base + ".mp3"
+        final_audio.export(mp3_filename, format="mp3")
+        print(f"Also exported as {mp3_filename}")
 
+def run_gui():
+    root = tk.Tk()
+    root.title("Chord Progression Generator")
+
+    tk.Label(root, text="Progression Length (chords per progression):").grid(row=0, column=0, sticky="w", padx=5, pady=5)
+    prog_length_entry = tk.Entry(root)
+    prog_length_entry.insert(0, "3")
+    prog_length_entry.grid(row=0, column=1, padx=5, pady=5)
+
+    tk.Label(root, text="Number of Progressions:").grid(row=1, column=0, sticky="w", padx=5, pady=5)
+    num_progressions_entry = tk.Entry(root)
+    num_progressions_entry.insert(0, "3")
+    num_progressions_entry.grid(row=1, column=1, padx=5, pady=5)
+
+    tk.Label(root, text="Output Filename (wav or mp3):").grid(row=2, column=0, sticky="w", padx=5, pady=5)
+    output_filename_entry = tk.Entry(root)
+    output_filename_entry.insert(0, "chord_progressions.wav")
+    output_filename_entry.grid(row=2, column=1, padx=5, pady=5)
+
+    status_label = tk.Label(root, text="")
+    status_label.grid(row=4, column=0, columnspan=2, padx=5, pady=5)
+
+    def generate():
+        try:
+            prog_length = int(prog_length_entry.get())
+            num_progressions = int(num_progressions_entry.get())
+            output_filename = output_filename_entry.get().strip()
+            if not output_filename:
+                raise ValueError("Output filename cannot be empty")
+        except ValueError as e:
+            messagebox.showerror("Input error", str(e))
+            return
+
+        status_label.config(text="Generating...")
+        def run_generation():
+            try:
+                generate_audio(prog_length, num_progressions, output_filename)
+                status_label.config(text=f"Done! Saved as {output_filename}")
+            except Exception as e:
+                status_label.config(text="Error during generation")
+                messagebox.showerror("Error", str(e))
+        threading.Thread(target=run_generation).start()
+
+    generate_button = tk.Button(root, text="Generate", command=generate)
+    generate_button.grid(row=3, column=0, columnspan=2, padx=5, pady=5)
+
+    root.mainloop()
 
 if __name__ == '__main__':
-    main()
+    run_gui()
